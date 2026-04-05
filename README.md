@@ -1,36 +1,105 @@
 # Ternary-Native Vector Database
 
-A vector search engine that converts standard float32 embeddings into ternary vectors {-1, 0, +1}, demonstrating dramatically reduced memory usage compared to FAISS with near-perfect recall via a two-stage reranking pipeline.
+---
+
+## Abstract
+
+Modern vector databases store embeddings as 32-bit floats, spending four bytes per dimension regardless of how much information each dimension actually carries. This project investigates whether replacing float32 embeddings with ternary representations — where each dimension takes a value in $\{-1, 0, +1\}$ — can meaningfully reduce memory consumption without sacrificing retrieval quality. Using 50,000 passages from MS MARCO and a standard sentence embedding model, we build a ternary index that achieves a 4x reduction in index memory (76.8 MB → 19.2 MB) with 86.5% Recall@10 against a FAISS float32 baseline. A two-stage pipeline that uses ternary search for candidate retrieval followed by float cosine reranking recovers 99.9% Recall@10 at the same memory footprint. We also show, via radix economy theory, why base-3 is the most information-efficient integer number system, and why the signed alphabet $\{-1, 0, +1\}$ is the only ternary representation that preserves the geometric structure of embedding space.
+
+---
+
+## Methodology
+
+### Dataset and Embeddings
+
+We use the MS MARCO passage retrieval corpus (v1.1), sampling 50,000 passages from the training split. Each passage is encoded with `sentence-transformers/all-MiniLM-L6-v2`, producing 384-dimensional float32 vectors that are unit-normalized by construction (all L2 norms = 1.0, values in the range −0.28 to +0.28 with std = 0.05).
+
+### Baseline: FAISS Flat Index
+
+The float32 baseline uses a FAISS `IndexFlatIP` (inner product) index over L2-normalized vectors, which is equivalent to exact cosine similarity search. This is a brute-force flat index — no approximation, no quantization — and serves as the upper bound on retrieval quality. Index memory is exactly $N \times D \times 4$ bytes = 76.8 MB for $N = 50{,}000$, $D = 384$.
+
+### Ternary Quantization
+
+Each float32 embedding is converted to a ternary vector using a threshold $\delta$:
+
+$$t_i = \begin{cases} +1 & \text{if } v_i > \delta \\ -1 & \text{if } v_i < -\delta \\ \phantom{+}0 & \text{otherwise} \end{cases}$$
+
+Dimensions within $[-\delta, +\delta]$ are treated as carrying insufficient signal and zeroed out. The resulting vectors are stored as int8, giving an unconditional 4x memory reduction over float32 regardless of $\delta$.
+
+Similarity between a query $\mathbf{q}$ and a corpus vector $\mathbf{t}$ is computed as their integer dot product:
+
+$$\text{score}(\mathbf{q}, \mathbf{t}) = \mathbf{q}_T \cdot \mathbf{t}_T = \sum_i q^T_i \cdot t_i$$
+
+where $\mathbf{q}_T$ and $\mathbf{t}_T$ are the ternary-quantized forms of query and document respectively. This counts agreements minus disagreements across non-zero dimensions, approximating cosine similarity in the original float space.
+
+### Threshold Selection
+
+$\delta$ is the single tunable hyperparameter. We sweep $\delta$ from 0.005 to 0.30 in 40 steps, measuring Recall@10 and sparsity at each point using 300 sampled queries against the FAISS ground truth. The optimal $\delta$ is the largest value that keeps Recall@10 above the target threshold before the elbow of the recall curve.
+
+![Recall vs delta](assets/chart1_recall_vs_delta.png)
+
+For `all-MiniLM-L6-v2`, the elbow falls at approximately $\delta = 0.05$, beyond which recall collapses rapidly as the tight value distribution ($\sigma = 0.05$) causes most dimensions to be zeroed out. We use $\delta = 0.02$, which achieves 31% sparsity and 86.5% Recall@10.
+
+### Two-Stage Reranking Pipeline
+
+To recover recall without increasing index memory, we implement a two-stage pipeline:
+
+```
+Query ──→ Ternary index (top-C candidates) ──→ Float cosine rerank (top-k)
+```
+
+Stage 1 uses the ternary index to retrieve the top $C = 100$ candidates. Stage 2 computes exact float cosine similarity between the query and those 100 candidates and returns the top $k = 10$. The float vectors required for reranking are held in memory separately but the ternary index itself remains at 19.2 MB.
+
+### Evaluation
+
+We measure the following for each system:
+
+- **Recall@10**: fraction of the FAISS top-10 recovered, averaged over 500 queries. Formally, $\frac{1}{|Q|} \sum_{q \in Q} \frac{|\hat{R}_q \cap R_q|}{k}$, where $R_q$ is the FAISS top-$k$ and $\hat{R}_q$ is the system's top-$k$.
+- **Index RAM**: exact byte count of the stored index vectors.
+- **Query throughput (QPS)**: total queries divided by total wall-clock search time, measured over 500 sequential single-query searches.
 
 ---
 
 ## Results
 
-All benchmarks run on 50,000 MS MARCO passages, `all-MiniLM-L6-v2` embeddings (384-dim), 500 queries, k=10.
+All benchmarks run on 50,000 MS MARCO passages, 500 queries, $k = 10$, on Apple Silicon (CPU only).
 
-| Metric | FAISS Float32 | Ternary (δ=0.02) | Ternary + Reranker |
+| Metric | FAISS Float32 | Ternary ($\delta$=0.02) | Ternary + Reranker |
 |---|---|---|---|
 | Index RAM | 76.8 MB | 19.2 MB | 19.2 MB |
+| Compression | — | 4x | 4x |
 | QPS | 209 | 54 | 55 |
 | Recall@10 | 100% (reference) | 86.5% | 99.9% |
 | Sparsity | 0% | 31% | — |
-| Compression | — | 4x | 4x |
 
 ![Memory comparison](assets/chart2_memory_comparison.png)
 
 ![Throughput and recall](assets/chart3_throughput_recall.png)
 
-![Recall vs delta](assets/chart1_recall_vs_delta.png)
+---
 
-### What the experiment showed
+## Discussion
 
-The 4x memory reduction is exact and free. int8 stores 4 bytes fewer per value than float32 — no approximation, no algorithmic tradeoff. This holds regardless of δ or embedding model.
+### Memory compression is exact and unconditional
 
-Raw ternary recall tops out at ~86% for this model. `all-MiniLM-L6-v2` produces unit-normalized embeddings in a tight range (−0.28 to +0.28, std=0.05). Any δ > 0.05 zeros out most of the signal; any δ < 0.01 turns every dimension into ±1, losing magnitude distinction. The useful window is narrow, and the max recoverable recall within it is ~87%.
+The 4x memory reduction follows directly from the dtype change (float32 → int8) and holds regardless of $\delta$, model, or corpus. It requires no approximation and introduces no algorithmic complexity. In memory-constrained environments — mobile, edge, or large-scale serving — this is a free win.
 
-The more practical result is the reranking pipeline: use ternary to fetch the top-100 candidates, then rerank with full float cosine similarity. That gets to 99.9% Recall@10 at the same 4x memory footprint. The ternary index acts as a fast, cheap filter; the float reranker restores precision.
+### The recall ceiling is model-dependent
 
-Ternary is conceptually faster than float search, but the speedup only materializes with SIMD-optimized bitpacking. Pure NumPy int16 matmul does not exploit sparsity and was slower than FAISS's heavily tuned float kernels on this hardware.
+Raw ternary recall peaked at ~87% for this model, short of the 88% target. The root cause is the embedding distribution: `all-MiniLM-L6-v2` produces unit-normalized vectors with values concentrated in a narrow range ($\sigma = 0.05$, max $\approx 0.28$). This means:
+
+- Any $\delta > 0.05$ zeros out the majority of dimensions, rapidly destroying recall.
+- Any $\delta < 0.01$ preserves nearly all dimensions as $\pm 1$, losing the magnitude distinction that differentiates strong signals from weak ones.
+
+The useful range of $\delta$ is narrow, and within it the maximum achievable recall is constrained. Models with larger dynamic range — or models explicitly trained with ternary quantization in mind — would compress more favorably.
+
+### Ternary search throughput
+
+The ternary index was slower than FAISS (54 vs 209 QPS) in this implementation. This is expected: the theoretical speed advantage of integer arithmetic over float arithmetic only materializes with SIMD bitpacking, where ternary values are packed into 2 bits each and dot products are computed with bitwise operations. NumPy int16 matmul makes no use of the sparsity structure and cannot compete with FAISS's AVX2-optimized float kernels. A production ternary implementation would require a dedicated SIMD kernel or hardware support.
+
+### The reranker is the practical result
+
+The two-stage pipeline is the most useful finding. It achieves 99.9% Recall@10 — statistically indistinguishable from the float baseline — at 4x lower index memory and similar throughput to the raw ternary search. The cost is that the float vectors must be stored separately for reranking, so the total memory across both stages is higher than the ternary index alone. In practice, the float vectors could live on disk and be accessed only for the small candidate set, making the reranker genuinely memory-efficient end-to-end.
 
 ---
 
@@ -73,61 +142,15 @@ Finally, $\{-1, 0, +1\}$ is closed under negation: flipping all signs gives anot
 
 ---
 
-## How It Works
+## Conclusion
 
-The quantizer maps each float dimension to {-1, 0, +1} using a threshold δ:
+Ternary quantization is a practical and theoretically well-motivated approach to reducing the memory cost of vector search. The 4x compression from float32 → int8 is exact and free; the recall penalty at optimal $\delta$ is modest (~13.5% for this model); and the two-stage reranking pipeline recovers near-perfect recall at the same index size. The main limitation of this implementation is throughput — the speed advantage of ternary arithmetic requires SIMD bitpacking to realize, which is beyond the scope of a NumPy implementation.
 
-```
-value < -δ   →  -1   (strong negative signal)
--δ ≤ v ≤ +δ  →   0   (weak/irrelevant — zeroed out)
-value > +δ   →  +1   (strong positive signal)
-```
-
-The δ threshold controls sparsity. A larger δ zeros out more dimensions (more compression, lower recall). The `02_quantization` notebook sweeps δ from 0.005 to 0.30 and identifies the elbow where recall starts to collapse.
-
-For `all-MiniLM-L6-v2`, δ = 0.02 is optimal: 31% sparsity, 86.5% Recall@10.
-
-### Two-Stage Reranking Pipeline
-
-```
-Query (float) ──→ Ternary search (top-100) ──→ Float cosine rerank (top-10)
-                  [fast, low-memory]            [precise, small candidate set]
-```
-
-Stage 1 uses the 19.2 MB ternary index to quickly eliminate 99.8% of the corpus. Stage 2 applies exact cosine similarity only to the 100 survivors, which is cheap. Combined result: 99.9% Recall@10 at 4x lower memory than a pure float index.
+The deeper result is about the embedding model itself. A model whose values are concentrated near zero will compress poorly under any threshold-based scheme, because the signal and noise occupy the same range. Future work could investigate models trained with ternary-aware objectives, or adaptive per-dimension thresholds that account for the variance of each dimension across the corpus.
 
 ---
 
-## Project Structure
-
-```
-ternary-vector-db/
-├── src/
-│   ├── embed.py        # Generate float32 embeddings from MS MARCO
-│   ├── quantize.py     # Float → ternary conversion + delta sweep
-│   ├── index.py        # TernaryIndex class (.add / .search / .batch_search)
-│   ├── baseline.py     # FAISSBaseline class (same interface)
-│   ├── rerank.py       # Two-stage reranking pipeline
-│   └── benchmark.py    # Head-to-head evaluation: FAISS vs Ternary vs Reranker
-├── notebooks/
-│   ├── 01_exploration.ipynb   # Dataset inspection + embedding distribution
-│   ├── 02_quantization.ipynb  # Delta sweep, optimal threshold selection
-│   └── 03_results.ipynb       # Final benchmark charts
-├── results/
-│   ├── chart1_recall_vs_delta.png
-│   ├── chart2_memory_comparison.png
-│   ├── chart3_throughput_recall.png
-│   ├── delta_sweep.csv
-│   └── benchmark_results.csv
-├── embeddings/
-│   ├── float32/        # Saved float32 .npy arrays (76.8 MB)
-│   └── ternary/        # Saved int8 .npy arrays + chosen delta (19.2 MB)
-└── requirements.txt
-```
-
----
-
-## Quick Start
+## Reproducing the Results
 
 ```bash
 pip install -r requirements.txt
@@ -149,6 +172,27 @@ Run notebooks in order: `01_exploration` → `02_quantization` → `03_results`
 
 ---
 
+## Project Structure
+
+```
+ternary-vector-db/
+├── src/
+│   ├── embed.py        # Generate float32 embeddings from MS MARCO
+│   ├── quantize.py     # Float → ternary conversion + delta sweep
+│   ├── index.py        # TernaryIndex class (.add / .search / .batch_search)
+│   ├── baseline.py     # FAISSBaseline class (same interface)
+│   ├── rerank.py       # Two-stage reranking pipeline
+│   └── benchmark.py    # Head-to-head evaluation: FAISS vs Ternary vs Reranker
+├── notebooks/
+│   ├── 01_exploration.ipynb   # Dataset inspection + embedding distribution
+│   ├── 02_quantization.ipynb  # Delta sweep, optimal threshold selection
+│   └── 03_results.ipynb       # Final benchmark charts
+├── assets/             # Charts embedded in this README
+└── requirements.txt
+```
+
+---
+
 ## Stack
 
 - Python 3.10, NumPy, PyTorch
@@ -160,7 +204,7 @@ Run notebooks in order: `01_exploration` → `02_quantization` → `03_results`
 
 ## Connection to Ternary SNNs
 
-This project is a direct precursor to a Ternary Spiking Neural Network implementation. The δ threshold here maps to the membrane firing threshold in a spiking neuron; ternary weights {-1, 0, +1} are identical to ternary synaptic weights in TWN-style networks; and the sparsity pattern mirrors sparse spike trains in biological neural networks, where most neurons are silent most of the time.
+This project is a direct precursor to a Ternary Spiking Neural Network implementation. The $\delta$ threshold here maps to the membrane firing threshold in a spiking neuron; ternary weights $\{-1, 0, +1\}$ are identical to ternary synaptic weights in TWN-style networks; and the sparsity pattern mirrors sparse spike trains in biological neural networks, where most neurons are silent most of the time.
 
 The radix economy argument applies there too: ternary synapses carry more information per weight than binary synapses, which is part of why biological synapses are graded rather than all-or-nothing.
 
