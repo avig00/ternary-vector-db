@@ -16,6 +16,12 @@ All benchmarks run on 50,000 MS MARCO passages, `all-MiniLM-L6-v2` embeddings (3
 | Sparsity | 0% | 31% | — |
 | Compression | — | 4x | 4x |
 
+![Memory comparison](assets/chart2_memory_comparison.png)
+
+![Throughput and recall](assets/chart3_throughput_recall.png)
+
+![Recall vs delta](assets/chart1_recall_vs_delta.png)
+
 ### What the experiment showed
 
 The 4x memory reduction is exact and free. int8 stores 4 bytes fewer per value than float32 — no approximation, no algorithmic tradeoff. This holds regardless of δ or embedding model.
