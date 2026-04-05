@@ -22,7 +22,7 @@ The float32 baseline uses a FAISS `IndexFlatIP` (inner product) index over L2-no
 
 Each float32 embedding is converted to a ternary vector using a threshold $\delta$:
 
-$$t_i = \begin{cases} +1 & \text{if } v_i > \delta \\ -1 & \text{if } v_i < -\delta \\ \phantom{+}0 & \text{otherwise} \end{cases}$$
+$$t_i = \begin{cases} +1 & \text{if } v_i > \delta \\ -1 & \text{if } v_i < -\delta \\ 0 & \text{otherwise} \end{cases}$$
 
 Dimensions within $[-\delta, +\delta]$ are treated as carrying insufficient signal and zeroed out. The resulting vectors are stored as int8, giving an unconditional 4x memory reduction over float32 regardless of $\delta$.
 
